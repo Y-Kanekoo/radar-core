@@ -1,0 +1,215 @@
+"""HTTP フェッチ層. httpx + ETag/If-Modified-Since + robots.txt 遵守."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from urllib.parse import urlparse, urlsplit
+from urllib.robotparser import RobotFileParser
+
+import httpx
+
+from radar_core._version import __version__
+
+USER_AGENT = f"radar-core/{__version__} (+https://github.com/Y-Kanekoo/radar-core)"
+DEFAULT_TIMEOUT = 30.0
+ACCEPT_HEADER = "application/atom+xml, application/rss+xml, application/xml, text/xml, */*"
+# リトライしても結果が変わらない TransportError のサブクラス.
+# URL スキーム不正 (UnsupportedProtocol) は同じ URL を繰り返し要求しても常に
+# 同じ理由で失敗するため、即座に失敗させてリトライ回数を消費しない.
+# 注意: LocalProtocolError はここに含めない。orchestrator.py で全ソースが単一の
+# httpx.AsyncClient を共有しコネクションプールを再利用しているため、h11 の
+# ステートマシン不整合に由来する一過性の LocalProtocolError が発生しうる。
+# 恒久エラー扱いにすると、リトライで自己修復できたはずのケースまで即失敗になり
+# store の consecutive_errors を無駄に増やしてアラート誤発火につながるため、
+# 通常の TransportError と同様にリトライ対象とする.
+PERMANENT_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (httpx.UnsupportedProtocol,)
+
+
+@dataclass
+class FetchResult:
+    """`fetch_feed()` の戻り値."""
+
+    url: str
+    status_code: int
+    content: bytes | None  # 304 Not Modified 時は None
+    etag: str | None
+    last_modified: str | None
+    error: str | None = None
+
+    @property
+    def is_modified(self) -> bool:
+        """200 で本文が取れている."""
+        return self.status_code == 200 and self.content is not None
+
+    @property
+    def is_not_modified(self) -> bool:
+        """304 Not Modified."""
+        return self.status_code == 304
+
+
+async def fetch_feed(
+    url: str,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    client: httpx.AsyncClient | None = None,
+    max_retries: int = 0,
+    retry_base_delay: float = 1.0,
+    user_agent: str = USER_AGENT,
+    transport: httpx.AsyncBaseTransport | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> FetchResult:
+    """RSS/Atom フィードを取得する.
+
+    ETag / Last-Modified が与えられた場合は条件付きGETで送信し、サーバが
+    304 Not Modified を返したら本文の再取得をスキップできる.
+
+    Args:
+        url: フィード URL.
+        etag: 前回取得時の ETag (あれば).
+        last_modified: 前回取得時の Last-Modified (あれば).
+        timeout: HTTP タイムアウト秒.
+        client: 共有 httpx.AsyncClient. None なら関数内で生成する.
+        max_retries: 一時的な失敗に対する最大リトライ回数.
+        retry_base_delay: 指数バックオフの基準待機秒.
+
+    Returns:
+        FetchResult. ネットワーク例外は `error` フィールドに格納する.
+    """
+    if client is not None and transport is not None:
+        raise ValueError("client と transport は同時に指定できません")
+    try:
+        urlsplit(url)
+    except ValueError:
+        return FetchResult(url, 0, None, None, None, "URLの形式が不正です")
+    headers = {"User-Agent": user_agent, "Accept": ACCEPT_HEADER}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+
+    # 負の値が渡されても無限ループ・添字異常にならないよう正規化する
+    max_retries = max(0, max_retries)
+
+    own_client = client is None
+    used_client = (
+        client
+        if client is not None
+        else (
+            httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+            if transport is None
+            else httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=transport)
+        )
+    )
+    try:
+        for attempt in range(max_retries + 1):
+            try:
+                resp = await used_client.get(url, headers=headers, timeout=timeout)
+            except httpx.TransportError as e:
+                if attempt < max_retries and not isinstance(e, PERMANENT_TRANSPORT_ERRORS):
+                    await sleep(max(0.0, retry_base_delay) * (2**attempt))
+                    continue
+                return FetchResult(
+                    url=url,
+                    status_code=0,
+                    content=None,
+                    etag=None,
+                    last_modified=None,
+                    error=f"フィード取得に失敗しました: {e}",
+                )
+            except (httpx.HTTPError, httpx.InvalidURL) as e:
+                return FetchResult(
+                    url=url,
+                    status_code=0,
+                    content=None,
+                    etag=None,
+                    last_modified=None,
+                    error=f"フィード取得に失敗しました: {e}",
+                )
+
+            if 500 <= resp.status_code <= 599 and attempt < max_retries:
+                await sleep(max(0.0, retry_base_delay) * (2**attempt))
+                continue
+
+            if resp.status_code == 304:
+                return FetchResult(
+                    url=url,
+                    status_code=304,
+                    content=None,
+                    etag=etag,
+                    last_modified=last_modified,
+                )
+
+            if resp.status_code != 200:
+                return FetchResult(
+                    url=url,
+                    status_code=resp.status_code,
+                    content=None,
+                    etag=None,
+                    last_modified=None,
+                    error=f"想定外のHTTPステータス: {resp.status_code}",
+                )
+
+            return FetchResult(
+                url=url,
+                status_code=200,
+                content=resp.content,
+                etag=resp.headers.get("etag"),
+                last_modified=resp.headers.get("last-modified"),
+            )
+        raise AssertionError("到達不能なリトライ状態です")
+    finally:
+        if own_client:
+            await used_client.aclose()
+
+
+class RobotsCache:
+    """robots.txt をホスト単位でキャッシュする.
+
+    fetch_feedとは独立して呼び出し元で適用する。
+    クロール1セッションを通して使い回す. 同じホストへの複数リクエストでも
+    robots.txt の取得は1回だけになる. キャッシュは在メモリで永続化しない.
+    """
+
+    def __init__(self) -> None:
+        # None は「robots.txt 取得失敗 (= 制限なしと解釈)」を表す
+        self._cache: dict[str, RobotFileParser | None] = {}
+
+    async def is_allowed(self, url: str, client: httpx.AsyncClient) -> bool:
+        """`url` のクロールが robots.txt 上許可されているか.
+
+        robots.txt が存在しない/取得失敗の場合は許可とする (47条の5政令要件は
+        robots.txt の Disallow を遵守することを求めるので、不在は許可解釈で安全).
+        """
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return True
+        if parsed.netloc not in self._cache:
+            self._cache[parsed.netloc] = await self._fetch_robots(
+                parsed.netloc, parsed.scheme, client
+            )
+        rp = self._cache[parsed.netloc]
+        if rp is None:
+            return True
+        return rp.can_fetch(USER_AGENT, url)
+
+    async def _fetch_robots(
+        self, host: str, scheme: str, client: httpx.AsyncClient
+    ) -> RobotFileParser | None:
+        """robots.txt を取得しパースする. 失敗時は None を返す."""
+        try:
+            resp = await client.get(
+                f"{scheme}://{host}/robots.txt",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 200:
+            return None
+        rp = RobotFileParser()
+        rp.parse(resp.text.splitlines())
+        return rp
